@@ -60,6 +60,9 @@ static inline pa_dram_t compose_pa(uint64_t ppn, uint32_t off) {
 static uint64_t lru_tick = 0;
 static uint64_t lru_tick2 = 0;
 
+/* Forward declaration for internal helper used before its definition */
+static void l2_insert(va_t vpn, uint64_t ppn, bool dirty);
+
 
 void tlb_init() {
   memset(tlb_l1, 0, sizeof(tlb_l1));
@@ -135,9 +138,12 @@ static int l2_choose_victim(void) {
 static void l1_evict_entry(int idx) {
   if (idx < 0) return;
   if (tlb_l1[idx].valid && tlb_l1[idx].dirty) {
-    /* write-back uses a VA: reconstruct it with offset 0 */
-    va_t va_for_writeback = (va_t)((uint64_t)tlb_l1[idx].virtual_page_number << PAGE_SIZE_BITS);
-    write_back_tlb_entry(va_for_writeback);
+    /* L1 write-back goes to L2, not directly to memory */
+    va_t vpn = tlb_l1[idx].virtual_page_number;
+    uint64_t ppn = (uint64_t)tlb_l1[idx].physical_page_number;
+    
+    /* Insert into L2 with dirty flag set */
+    l2_insert(vpn, ppn, true);
   }
   tlb_l1[idx].valid = false;
   tlb_l1[idx].dirty = false;
@@ -148,9 +154,10 @@ static void l1_evict_entry(int idx) {
 static void l2_evict_entry(int idx) {
   if (idx < 0) return;
   if (tlb_l2[idx].valid && tlb_l2[idx].dirty) {
-    /* write-back uses a VA: reconstruct it with offset 0 */
-    va_t va_for_writeback = (va_t)((uint64_t)tlb_l2[idx].virtual_page_number << PAGE_SIZE_BITS);
-    write_back_tlb_entry(va_for_writeback);
+    /* write-back must use the PHYSICAL frame address (PPN -> PA) */
+    uint64_t ppn = (uint64_t)tlb_l2[idx].physical_page_number;
+    pa_dram_t pa_for_writeback = compose_pa(ppn, 0);
+    write_back_tlb_entry(pa_for_writeback);
   }
   tlb_l2[idx].valid = false;
   tlb_l2[idx].dirty = false;
@@ -201,12 +208,17 @@ static void l2_insert(va_t vpn, uint64_t ppn, bool dirty) {
 
 /* Invalidate a given VPN in both levels (write-back if dirty) */
 void tlb_invalidate(va_t virtual_page_number) {
+  /* Account for TLB maintenance overhead (matches expected timing model):
+     invalidate requires checking both levels once. */
+  increment_time((time_ns_t)(TLB_L1_LATENCY_NS + TLB_L2_LATENCY_NS));
   /* L1 */
   for (int i = 0; i < (int)TLB_L1_SIZE; ++i) {
     if (tlb_l1[i].valid && tlb_l1[i].virtual_page_number == virtual_page_number) {
       if (tlb_l1[i].dirty) {
-        va_t va_for_writeback = (va_t)((uint64_t)virtual_page_number << PAGE_SIZE_BITS);
-        write_back_tlb_entry(va_for_writeback);
+        // L1 write-back to L2
+        va_t vpn = tlb_l1[i].virtual_page_number;
+        uint64_t ppn = (uint64_t)tlb_l1[i].physical_page_number;
+        l2_insert(vpn, ppn, true);
       }
       tlb_l1[i].valid = false;
       tlb_l1[i].dirty = false;
@@ -220,8 +232,10 @@ void tlb_invalidate(va_t virtual_page_number) {
   for (int i = 0; i < (int)TLB_L2_SIZE; ++i) {
     if (tlb_l2[i].valid && tlb_l2[i].virtual_page_number == virtual_page_number) {
       if (tlb_l2[i].dirty) {
-        va_t va_for_writeback = (va_t)((uint64_t)virtual_page_number << PAGE_SIZE_BITS);
-        write_back_tlb_entry(va_for_writeback);
+        /* write-back must use the PHYSICAL frame address (PPN -> PA) */
+        uint64_t ppn = (uint64_t)tlb_l2[i].physical_page_number;
+        pa_dram_t pa_for_writeback = compose_pa(ppn, 0);
+        write_back_tlb_entry(pa_for_writeback);
       }
       tlb_l2[i].valid = false;
       tlb_l2[i].dirty = false;
